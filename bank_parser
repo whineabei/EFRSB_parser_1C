@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -258,6 +257,7 @@ def parse_message_details(driver: WebDriver, url: str, timeout: int) -> Dict[str
     court_act = info_items.get("Судебный акт", "")
 
     return {
+        "Тип сообщения": normalize_text(driver.find_element(By.TAG_NAME, "body").text).split(" Заказать выписку", 1)[0],
         "судебный акт": court_act,
         "№ дела": info_items.get("Дело", ""),
         "Арбитражный управляющий": extract_manager_name(driver),
@@ -393,14 +393,12 @@ def process_rows(
 
         if not site_url:
             print("  - ссылка отсутствует")
-            result_rows.append(base_row)
             continue
 
         try:
             messages = parse_card_messages(current_driver, site_url, timeout)
         except TimeoutException:
             print("  - карточка не загрузилась по таймауту")
-            result_rows.append(base_row)
             continue
         except Exception as error:
             if should_restart_driver(error):
@@ -412,16 +410,13 @@ def process_rows(
                     messages = parse_card_messages(current_driver, site_url, timeout)
                 except Exception as retry_error:
                     print(f"  - ошибка открытия карточки после перезапуска: {retry_error}")
-                    result_rows.append(base_row)
                     continue
             else:
                 print(f"  - ошибка открытия карточки: {error}")
-                result_rows.append(base_row)
                 continue
 
         if not messages:
             print("  - сообщения о судебном акте не найдены")
-            result_rows.append(base_row)
             continue
 
         print(f"  - найдено сообщений: {len(messages)}")
@@ -433,6 +428,12 @@ def process_rows(
                 details = parse_message_details(
                     current_driver, message["message_url"], timeout
                 )
+                message_type = normalize_text(details.get("Тип сообщения", ""))
+                court_act = normalize_text(details.get("судебный акт", ""))
+                if "Сообщение о судебном акте" not in message_type or not court_act:
+                    print("    * пропускаю запись: это не судебный акт или поле пустое")
+                    continue
+
                 output_row.update(details)
                 print(
                     "    * "
@@ -453,6 +454,12 @@ def process_rows(
                         details = parse_message_details(
                             current_driver, message["message_url"], timeout
                         )
+                        message_type = normalize_text(details.get("Тип сообщения", ""))
+                        court_act = normalize_text(details.get("судебный акт", ""))
+                        if "Сообщение о судебном акте" not in message_type or not court_act:
+                            print("    * пропускаю запись после перезапуска: это не судебный акт или поле пустое")
+                            continue
+
                         output_row.update(details)
                         print(
                             "    * "
