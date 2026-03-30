@@ -1,17 +1,13 @@
 from __future__ import annotations
 
 import argparse
-import io
 import re
-import shutil
 import subprocess
 import sys
 import time
-import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import requests
 import undetected_chromedriver as uc
 from openpyxl import Workbook, load_workbook
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
@@ -23,10 +19,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = BASE_DIR / "307 шт. - для парсера.xlsx"
-DRIVER_ROOT = BASE_DIR / "drivers"
-DRIVER_DIR = DRIVER_ROOT / "chromedriver-win64"
-DRIVER_PATH = DRIVER_DIR / "chromedriver.exe"
-VERSIONS_URL = "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
 NEW_COLUMNS = [
     "Дата публикации",
     "судебный акт",
@@ -81,7 +73,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_command(command: List[str]) -> str:
-    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    kwargs = {
+        "capture_output": True,
+        "text": True,
+        "check": True,
+    }
+    if sys.platform.startswith("win"):
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        kwargs["startupinfo"] = startupinfo
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    result = subprocess.run(command, **kwargs)
     return result.stdout.strip()
 
 
@@ -112,79 +114,6 @@ def get_chrome_version(chrome_path: Path) -> str:
     return version
 
 
-def get_local_driver_version(driver_path: Path) -> Optional[str]:
-    if not driver_path.exists():
-        return None
-    try:
-        output = run_command([str(driver_path), "--version"])
-    except Exception:
-        return None
-    match = re.search(r"(\d+\.\d+\.\d+\.\d+)", output)
-    return match.group(1) if match else None
-
-
-def load_versions_manifest() -> dict:
-    response = requests.get(VERSIONS_URL, timeout=60)
-    response.raise_for_status()
-    return response.json()
-
-
-def resolve_driver_download(manifest: dict, chrome_version: str) -> str:
-    exact_match = None
-    major = chrome_version.split(".", 1)[0]
-    fallback_match = None
-
-    for item in manifest.get("versions", []):
-        version = item.get("version", "")
-        if version == chrome_version:
-            exact_match = item
-            break
-        if version.split(".", 1)[0] == major:
-            fallback_match = item
-
-    chosen = exact_match or fallback_match
-    if not chosen:
-        raise RuntimeError(
-            f"Для версии Chrome {chrome_version} не найден подходящий chromedriver."
-        )
-
-    downloads = chosen.get("downloads", {}).get("chromedriver", [])
-    for entry in downloads:
-        if entry.get("platform") == "win64":
-            return entry["url"]
-
-    raise RuntimeError("В манифесте нет win64 chromedriver.")
-
-
-def ensure_matching_driver(chrome_version: str) -> Path:
-    local_version = get_local_driver_version(DRIVER_PATH)
-    if local_version == chrome_version:
-        print(f"[driver] Использую локальный chromedriver {local_version}")
-        return DRIVER_PATH
-
-    print(f"[driver] Нужен chromedriver для Chrome {chrome_version}")
-    manifest = load_versions_manifest()
-    download_url = resolve_driver_download(manifest, chrome_version)
-    print(f"[driver] Скачиваю: {download_url}")
-
-    response = requests.get(download_url, timeout=120)
-    response.raise_for_status()
-
-    if DRIVER_ROOT.exists():
-        shutil.rmtree(DRIVER_ROOT)
-    DRIVER_ROOT.mkdir(parents=True, exist_ok=True)
-
-    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-        archive.extractall(DRIVER_ROOT)
-
-    downloaded_version = get_local_driver_version(DRIVER_PATH)
-    if not downloaded_version:
-        raise RuntimeError("После скачивания chromedriver не найден или не читается.")
-
-    print(f"[driver] Готово: chromedriver {downloaded_version}")
-    return DRIVER_PATH
-
-
 def normalize_text(value: Optional[str]) -> str:
     if value is None:
         return ""
@@ -203,6 +132,10 @@ def extract_status(court_act: str) -> str:
     return "завершено" if "о завершении" in normalized else "не завершено"
 
 
+def is_court_act_message(value: str) -> bool:
+    return "сообщение о судебном акте" in normalize_text(value).lower()
+
+
 def build_output_path(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem}_result.xlsx")
 
@@ -215,10 +148,37 @@ def wait_for_page(driver: WebDriver, timeout: int) -> None:
 
 
 def safe_get(driver: WebDriver, url: str, timeout: int) -> None:
-    driver.get(url)
-    wait_for_page(driver, timeout)
-    WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(1.5)
+    last_error: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            driver.get(url)
+            wait_for_page(driver, timeout)
+            WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            time.sleep(1.5)
+            return
+        except Exception as error:
+            last_error = error
+            message = str(error).lower()
+            is_network_error = any(
+                marker in message
+                for marker in [
+                    "err_connection_closed",
+                    "err_connection_reset",
+                    "err_connection_aborted",
+                    "err_network_changed",
+                    "err_timed_out",
+                    "net::",
+                ]
+            )
+            if attempt == 1 or not is_network_error:
+                raise
+            print(f"[retry] Повторяю открытие страницы после сетевой ошибки: {url}")
+            time.sleep(2)
+
+    if last_error:
+        raise last_error
 
 
 def parse_info_items(driver: WebDriver) -> Dict[str, str]:
@@ -279,6 +239,11 @@ def parse_card_messages(driver: WebDriver, url: str, timeout: int) -> List[Dict[
             continue
 
         row = message_link.find_element(By.XPATH, "./ancestor::tr[1]")
+        row_text = normalize_text(row.text)
+        link_text = normalize_text(message_link.text)
+        if not is_court_act_message(link_text) and not is_court_act_message(row_text):
+            continue
+
         cells = row.find_elements(By.XPATH, "./td")
         publication_date = extract_only_date(cells[0].text if cells else "")
         messages.append({"Дата публикации": publication_date, "message_url": href})
@@ -287,20 +252,30 @@ def parse_card_messages(driver: WebDriver, url: str, timeout: int) -> List[Dict[
     return messages
 
 
-def init_driver(driver_path: Path, chrome_version: str, headless: bool) -> WebDriver:
+def init_driver(
+    chrome_path: Path,
+    chrome_version: str,
+    headless: bool,
+) -> WebDriver:
     options = uc.ChromeOptions()
     options.add_argument("--window-size=1600,1000")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--no-default-browser-check")
     options.add_argument("--disable-popup-blocking")
+    options.add_argument("--lang=ru-RU")
     if headless:
         options.add_argument("--headless=new")
+
+    print(
+        f"[driver] Запускаю undetected_chromedriver для Chrome major "
+        f"{chrome_version.split('.', 1)[0]}"
+    )
 
     driver = uc.Chrome(
         options=options,
         version_main=int(chrome_version.split(".", 1)[0]),
-        driver_executable_path=str(driver_path),
+        browser_executable_path=str(chrome_path),
         use_subprocess=True,
     )
     driver.set_page_load_timeout(120)
@@ -319,13 +294,18 @@ def should_restart_driver(error: Exception) -> bool:
             "httpconnectionpool",
             "max retries exceeded",
             "web view not found",
+            "err_connection_closed",
+            "err_connection_reset",
+            "err_connection_aborted",
+            "err_network_changed",
+            "net::",
         ]
     )
 
 
 def restart_driver(
     driver: WebDriver,
-    driver_path: Path,
+    chrome_path: Path,
     chrome_version: str,
     headless: bool,
 ) -> WebDriver:
@@ -334,7 +314,7 @@ def restart_driver(
     except Exception:
         pass
     time.sleep(1)
-    return init_driver(driver_path, chrome_version, headless)
+    return init_driver(chrome_path, chrome_version, headless)
 
 
 def read_input_rows(input_path: Path, sheet_name: Optional[str]) -> tuple[str, List[str], List[Dict[str, str]]]:
@@ -373,7 +353,7 @@ def process_rows(
     source_headers: List[str],
     timeout: int,
     limit: Optional[int],
-    driver_path: Path,
+    chrome_path: Path,
     chrome_version: str,
     headless: bool,
 ) -> tuple[List[Dict[str, str]], WebDriver]:
@@ -404,7 +384,7 @@ def process_rows(
             if should_restart_driver(error):
                 print("  - драйвер отвалился, перезапускаю браузер")
                 current_driver = restart_driver(
-                    current_driver, driver_path, chrome_version, headless
+                    current_driver, chrome_path, chrome_version, headless
                 )
                 try:
                     messages = parse_card_messages(current_driver, site_url, timeout)
@@ -419,7 +399,7 @@ def process_rows(
             print("  - сообщения о судебном акте не найдены")
             continue
 
-        print(f"  - найдено сообщений: {len(messages)}")
+        print(f"  - найдено сообщений о судебном акте: {len(messages)}")
         for message in messages:
             output_row = dict(base_row)
             output_row["Дата публикации"] = message.get("Дата публикации", "")
@@ -448,7 +428,7 @@ def process_rows(
                 if should_restart_driver(error):
                     print("    * драйвер отвалился на сообщении, перезапускаю и пробую еще раз")
                     current_driver = restart_driver(
-                        current_driver, driver_path, chrome_version, headless
+                        current_driver, chrome_path, chrome_version, headless
                     )
                     try:
                         details = parse_message_details(
@@ -486,11 +466,10 @@ def main() -> int:
 
     chrome_path = detect_chrome_path()
     chrome_version = get_chrome_version(chrome_path)
-    driver_path = ensure_matching_driver(chrome_version)
     sheet_name, source_headers, input_rows = read_input_rows(input_path, args.sheet)
     output_headers = source_headers + [column for column in NEW_COLUMNS if column not in source_headers]
 
-    driver = init_driver(driver_path, chrome_version, args.headless)
+    driver = init_driver(chrome_path, chrome_version, args.headless)
     try:
         result_rows, driver = process_rows(
             driver=driver,
@@ -498,7 +477,7 @@ def main() -> int:
             source_headers=output_headers,
             timeout=args.timeout,
             limit=args.limit,
-            driver_path=driver_path,
+            chrome_path=chrome_path,
             chrome_version=chrome_version,
             headless=args.headless,
         )

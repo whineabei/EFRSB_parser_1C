@@ -1,0 +1,5 @@
+requests==2.33.0
+selenium==4.41.0
+openpyxl==3.1.5
+undetected-chromedriver==3.5.5
+PyQt6==6.10.2
